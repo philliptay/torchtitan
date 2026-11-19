@@ -26,6 +26,8 @@ from torchtitan.rl.actors.monarch.system import MonarchActorSystem
 
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import rollouter as rollouter_module, RolloutGroup
+from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
+from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import MessageEnvRolloutWorker, Rollouter
 from torchtitan.rl.rollout.types import (
     PromptImage,
@@ -46,12 +48,12 @@ class _ChooseRunGroupEndpoint:
         # The rollouts of the group the worker returns.
         self.rollouts: list[Rollout] = []
 
-    def choose(self, **kwargs) -> asyncio.Future[RolloutGroup]:
+    def choose(self, **kwargs) -> asyncio.Future[FinishedRolloutGroup]:
         self.calls.append(kwargs)
         self.started.set()
         return asyncio.create_task(self._execute(kwargs))
 
-    async def _execute(self, kwargs) -> RolloutGroup:
+    async def _execute(self, kwargs) -> FinishedRolloutGroup:
         try:
             await self.release.wait()
         except asyncio.CancelledError:
@@ -59,7 +61,8 @@ class _ChooseRunGroupEndpoint:
             raise
         if self.error is not None:
             raise self.error
-        return RolloutGroup(group_id=kwargs["group_id"], rollouts=self.rollouts)
+        group = RolloutGroup(group_id=kwargs["group_id"], rollouts=self.rollouts)
+        return FinishedRolloutGroup(group=group, recorder_lines="")
 
 
 def test_rollout_worker_actor_builds_its_worker_and_inits_its_logger(
@@ -164,6 +167,7 @@ async def _setup(
         tokenizer_config="tokenizer_config",
         renderer_config="renderer_config",
         hf_assets_path="hf_assets_path",
+        rollout_recorder_config=RolloutSampleRecorder.Config(),
     )
     return worker_mesh
 
@@ -181,11 +185,13 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
         )
         rollouter = _rollouter_without_datasets()
 
+        recorder_config = RolloutSampleRecorder.Config(log_logprobs=True)
         await rollouter.setup_async(
             actor_system=MonarchActorSystem(MonarchActorSystem.Config()),
             tokenizer_config="tokenizer_config",
             renderer_config="renderer_config",
             hf_assets_path="hf_assets_path",
+            rollout_recorder_config=recorder_config,
         )
 
         assert host.spawn_kwargs == {"per_host": {"cpus": 3}}
@@ -204,6 +210,7 @@ def test_setup_spawns_worker_pool_on_controller_host(monkeypatch) -> None:
                 "tokenizer_config": "tokenizer_config",
                 "renderer_config": "renderer_config",
                 "hf_assets_path": "hf_assets_path",
+                "rollout_recorder_config": recorder_config,
                 "vision_processor_config": None,
             }
         ]
@@ -228,6 +235,7 @@ def test_rollout_group_dispatch_uses_choose(monkeypatch) -> None:
                 group_id=1,
                 group_size=2,
                 sampling="sampling",
+                for_training=True,
             )
         )
         await actor_mesh.run_group.started.wait()
@@ -239,11 +247,12 @@ def test_rollout_group_dispatch_uses_choose(monkeypatch) -> None:
                 "group_id": 1,
                 "group_size": 2,
                 "sampling": "sampling",
+                "for_training": True,
             }
         ]
 
         actor_mesh.run_group.release.set()
-        assert (await dispatch).group_id == 1
+        assert (await dispatch).group.group_id == 1
         await rollouter.close()
         assert actor_mesh.stopped
 
@@ -262,27 +271,34 @@ def test_run_group_rollouts_logs_the_call_duration_and_the_payload(monkeypatch) 
         actor_mesh = _WorkerActorMesh()
         rollouter = _rollouter_without_datasets()
         await _setup(rollouter, actor_mesh, monkeypatch)
-        turn = _TurnWithTopkLogprobs(
-            rollout_id=RolloutTurnID(group_id=1, rollout_id=0, turn_id=0),
-            prompt_prefix_len=0,
-            prompt_delta_token_ids=np.zeros(3, dtype=np.int32),  # 12 bytes
-            prompt_delta_images=(
-                PromptImage(
-                    hash_value="h",
-                    source_path="a.png",
-                    grid_thw=(1, 2, 2),
-                    data=b"x" * 100,
-                ),
-            ),
-            prompt_delta_image_placeholders=(PlaceholderRange(offset=0, length=1),),
-            completion_token_ids=np.zeros(2, dtype=np.int32),  # 8 bytes
-            completion_logprobs=np.zeros(2, dtype=np.float32),  # 8 bytes
-            completion_topk_logprobs=np.zeros((2, 4), dtype=np.float32),  # 32 bytes
+        # Both rollouts show one image file, shared as `slim_rollout_group` leaves it.
+        image = PromptImage(
+            hash_value="h", source_path="a.png", grid_thw=(1, 2, 2), data=b"x" * 100
         )
         actor_mesh.run_group.rollouts = [
             Rollout(
-                group_id=1, rollout_id=0, turns=[turn], status=RolloutStatus.COMPLETED
+                group_id=1,
+                rollout_id=rollout_id,
+                turns=[
+                    _TurnWithTopkLogprobs(
+                        rollout_id=RolloutTurnID(
+                            group_id=1, rollout_id=rollout_id, turn_id=0
+                        ),
+                        prompt_prefix_len=0,
+                        prompt_delta_token_ids=np.zeros(3, dtype=np.int32),  # 12 bytes
+                        prompt_delta_images=(image,),
+                        prompt_delta_image_placeholders=(
+                            PlaceholderRange(offset=0, length=1),
+                        ),
+                        completion_token_ids=np.zeros(2, dtype=np.int32),  # 8 bytes
+                        completion_logprobs=np.zeros(2, dtype=np.float32),  # 8 bytes
+                        # 32 bytes
+                        completion_topk_logprobs=np.zeros((2, 4), dtype=np.float32),
+                    )
+                ],
+                status=RolloutStatus.COMPLETED,
             )
+            for rollout_id in range(2)
         ]
         dispatch = asyncio.create_task(
             rollouter.run_group_rollouts(
@@ -290,17 +306,18 @@ def test_run_group_rollouts_logs_the_call_duration_and_the_payload(monkeypatch) 
                 release_session_fn="release_session_fn",
                 sample="sample",
                 group_id=1,
-                group_size=1,
+                group_size=2,
                 sampling="sampling",
+                for_training=True,
             )
         )
         await actor_mesh.run_group.started.wait()
         # The reply takes 50 ms to arrive.
         await asyncio.sleep(0.05)
         actor_mesh.run_group.release.set()
-        group = await dispatch
+        finished = await dispatch
         await rollouter.close()
-        return m.MetricsProcessor._aggregate_metrics(group.metrics)
+        return m.MetricsProcessor._aggregate_metrics(finished.group.metrics)
 
     metrics = asyncio.run(run())
 
@@ -308,8 +325,11 @@ def test_run_group_rollouts_logs_the_call_duration_and_the_payload(monkeypatch) 
     assert metrics["timing/hop/run_group/call_duration/max"] == pytest.approx(
         metrics["timing/hop/run_group/call_duration/mean"]
     )
-    # Every array field counts, including ones RolloutTurn itself does not declare.
-    assert metrics["payload/rollout_group_array_bytes/mean"] == 12 + 100 + 8 + 8 + 32
+    # Every array field counts, including ones RolloutTurn itself does not declare, and the
+    # shared image file once.
+    assert (
+        metrics["payload/rollout_group_array_bytes/mean"] == 2 * (12 + 8 + 8 + 32) + 100
+    )
 
 
 async def _dispatch_then_cancel_caller(
@@ -324,6 +344,7 @@ async def _dispatch_then_cancel_caller(
             group_id=1,
             group_size=2,
             sampling="sampling",
+            for_training=True,
         )
     )
     await actor_mesh.run_group.started.wait()
