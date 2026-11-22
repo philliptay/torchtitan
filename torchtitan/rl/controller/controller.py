@@ -648,9 +648,6 @@ class Controller(Configurable):
         self._packed_groups_by_id: dict[
             int, PackedRolloutGroup | PackedRolloutGroupHandle
         ] = {}
-        # Groups that stay in a rollout worker (`BaseRolloutWorker.Config.rdma_min_group_bytes`):
-        # releasing one tells the workers.
-        self._handle_group_ids: set[int] = set()
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
@@ -859,6 +856,9 @@ class Controller(Configurable):
                 pad_id=self.tokenizer.eos_id,
                 temperature=self._sampling.temperature,
                 vision_processor=config.vision_processor,
+                rollout_groups_by_rdma=(
+                    config.rollouter.worker.rdma_min_group_bytes is not None
+                ),
             )
             # TODO: torch.compile with aot_eager backend (inductor crashes the vLLM engine on the shared model path).
             self.generator_router = await actor_system.spawn_generator_router(
@@ -1361,10 +1361,8 @@ class Controller(Configurable):
                 finished = replace(finished, recorder_lines="")
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
-                if self.config.rollouter.worker.rdma_min_group_bytes is not None:
-                    # Its worker may have kept it before the failure (workers ignore ids they
-                    # do not hold).
-                    self._rollouter.release_groups([work.group_id])
+                # Its worker may have kept it before the failure. As an empty group it is
+                # untrainable, so `_batcher_loop` releases it to the workers like any other.
                 finished = FinishedRolloutGroup.from_group(
                     RolloutGroup(
                         group_id=work.group_id,
@@ -1413,8 +1411,6 @@ class Controller(Configurable):
                     group_is_trainable,
                 ) = await self.batcher.add_group.call_one(summary=finished.summary)
                 add_group_call_duration_s.append(time.perf_counter() - start)
-            if isinstance(finished.packed, PackedRolloutGroupHandle):
-                self._handle_group_ids.add(finished.group_id)
             if group_is_trainable:
                 self._packed_groups_by_id[finished.group_id] = finished.packed
             else:
@@ -1707,11 +1703,7 @@ class Controller(Configurable):
             sum(group.num_bytes for group in column.rollout_groups)
             for column in columns
         ]
-        column_rdma_bytes = [
-            sum(handle.num_bytes for handle in column.rollout_group_handles)
-            for column in columns
-        ]
-        return [
+        metrics = [
             # The leader's handler only keeps the column, so each call's duration is the
             # transfer.
             *compute_call_duration_metrics(
@@ -1722,12 +1714,20 @@ class Controller(Configurable):
             m.Metric(
                 "payload/replica_column_packed_bytes", m.Mean.from_list(column_bytes)
             ),
-            # What each leader reads from the rollout workers instead (groups that stay there).
-            m.Metric(
-                "payload/replica_column_rdma_bytes",
-                m.Mean.from_list(column_rdma_bytes),
-            ),
         ]
+        if self.config.rollouter.worker.rdma_min_group_bytes is not None:
+            # What each leader reads from the rollout workers instead (groups that stay there).
+            column_rdma_bytes = [
+                sum(handle.num_bytes for handle in column.rollout_group_handles)
+                for column in columns
+            ]
+            metrics.append(
+                m.Metric(
+                    "payload/replica_column_rdma_bytes",
+                    m.Mean.from_list(column_rdma_bytes),
+                )
+            )
+        return metrics
 
     async def _pull_model_state_dict_and_release_groups(
         self, version: int, *, trainable_group_ids: list[int]
@@ -1750,13 +1750,10 @@ class Controller(Configurable):
         return pull_s
 
     async def _release_groups(self, group_ids: list[int], *, reason: str) -> None:
-        """Free the groups' active slots (`RolloutGroupWorkBuffer.release_slots`), and tell the
-        rollout workers to reuse the buffers of those that stay there. Every read of a
-        trained group's buffer ends before its step's `forward_backward` returns, before this."""
+        """Free the groups' active slots (`RolloutGroupWorkBuffer.release_slots`). When groups
+        can stay in the rollout workers, tell every worker too: the one that keeps a group
+        returns its buffer to its pool, and the others ignore the id. Every read of a trained
+        group's buffer ends before its step's `forward_backward` returns, before this."""
         await self._group_buffer.release_slots(group_ids, reason=reason)
-        handle_group_ids = [
-            group_id for group_id in group_ids if group_id in self._handle_group_ids
-        ]
-        if handle_group_ids:
-            self._handle_group_ids.difference_update(handle_group_ids)
-            self._rollouter.release_groups(handle_group_ids)
+        if self.config.rollouter.worker.rdma_min_group_bytes is not None:
+            self._rollouter.release_groups(group_ids)
