@@ -1431,9 +1431,7 @@ def test_validate_rolls_out_each_prompt_n_times(
     controller.rollout_recorder = SimpleNamespace(record=lambda **kwargs: None)
     run_group_rollouts = AsyncMock(
         side_effect=[
-            FinishedRolloutGroup(
-                group=_scored_group(-(i + 1), group_rewards), recorder_lines=""
-            )
+            FinishedRolloutGroup.from_group(_scored_group(-(i + 1), group_rewards))
             for i, group_rewards in enumerate(rewards)
         ]
     )
