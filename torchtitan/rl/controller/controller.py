@@ -140,7 +140,6 @@ from torchtitan.rl.generator.mooncake_master import start_master
 from torchtitan.rl.generator.types import SamplingConfig
 from torchtitan.rl.model_state_dict_transport import ModelStateDictTransport
 from torchtitan.rl.observability import metrics as m
-from torchtitan.rl.rdma_object import RDMAPrompt
 from torchtitan.rl.rollout import RolloutGroup
 from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
 from torchtitan.rl.rollout.packed_group import PackedRolloutGroup, unpack_rollout_group
@@ -149,7 +148,7 @@ from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import Completion, GenerateFn, ReleaseSessionFn
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
-from torchtitan.rl.torch_transport_rdma import RDMAProbe
+from torchtitan.rl.torch_transport_rdma import RDMAProbe, RDMAPrompt
 from torchtitan.rl.trainer.batcher import Batcher, StepPlan
 from torchtitan.rl.trainer.microbatch_group_reader import ReplicaColumn
 from torchtitan.rl.trainer.trainer import Trainer

@@ -22,7 +22,6 @@ from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.actors.monarch.actor import Actor
-from torchtitan.rl.actors.monarch.rdma_object import MonarchRDMAObject
 from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
     FinishedRolloutGroup,
@@ -56,18 +55,25 @@ class RolloutWorkerActor(Actor):
         asyncio.get_running_loop().set_default_executor(
             ThreadPoolExecutor(max_workers=num_threads)
         )
+        # One torch transport and buffer pool for the large values this worker keeps: a group's
+        # prompt image files until its last generate call returns, then its packed training
+        # group until the controller releases it. Used only from the event loop's thread.
+        self._rdma_byte_buffers: RDMAByteBuffers | None = None
+        if (
+            worker_config.rdma_min_image_bytes is not None
+            or worker_config.rdma_min_group_bytes is not None
+        ):
+            self._rdma_byte_buffers = RDMAByteBuffers()
         if worker_config.rdma_min_image_bytes is not None:
             worker_kwargs = {
                 **worker_kwargs,
-                "register_rdma_object": MonarchRDMAObject.register,
+                "rdma_byte_buffers": self._rdma_byte_buffers,
             }
         self._worker = worker_config.build(**worker_kwargs)
-        # Large training groups stay here, packed, until the controller releases them.
         self._group_buffers: RolloutGroupBuffers | None = None
-        self._rdma_byte_buffers: RDMAByteBuffers | None = None
         self._rdma_probe: RDMAProbe | None = None
         if worker_config.rdma_min_group_bytes is not None:
-            self._rdma_byte_buffers = RDMAByteBuffers()
+            assert self._rdma_byte_buffers is not None
             self._group_buffers = RolloutGroupBuffers(
                 min_bytes=worker_config.rdma_min_group_bytes,
                 buffers=self._rdma_byte_buffers,

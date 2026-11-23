@@ -21,8 +21,8 @@ from torchtitan.rl.model_state_dict_transport import (
     TensorShard,
     TrainerSource,
 )
-from torchtitan.rl.rdma_object import RDMAPrompt
 from torchtitan.rl.rollout.types import Completion
+from torchtitan.rl.torch_transport_rdma import RDMAPrompt
 
 
 class _GeneratorActorEndpoints:
