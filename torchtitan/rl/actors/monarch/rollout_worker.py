@@ -22,6 +22,7 @@ from torchtitan.components.renderer import RendererConfig
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.observability import structured_logger as sl
 from torchtitan.rl.actors.monarch.actor import Actor
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout.finished_group import (
     finish_rollout_group,
     FinishedRolloutGroup,
@@ -59,6 +60,7 @@ class RolloutWorkerActor(Actor):
         # prompt image files until its last generate call returns, then its packed training
         # group until the controller releases it. Used only from the event loop's thread.
         self._rdma_byte_buffers: RDMAByteBuffers | None = None
+        self._num_pool_registrations_logged = 0
         if (
             worker_config.rdma_min_image_bytes is not None
             or worker_config.rdma_min_group_bytes is not None
@@ -133,10 +135,22 @@ class RolloutWorkerActor(Actor):
             )
             if for_training and self._rdma_byte_buffers is not None:
                 # With either knob: the pool never shrinks, so its size is worth watching.
-                finished.summary.group.metrics.extend(
-                    self._rdma_byte_buffers.pool_metrics()
-                )
+                finished.summary.group.metrics.extend(self._pool_metrics())
             return finished
+
+    def _pool_metrics(self) -> list[m.Metric]:
+        """This worker's buffer pool size, logged with each training group."""
+        assert self._rdma_byte_buffers is not None
+        pool = self._rdma_byte_buffers.pool
+        new_registrations = pool.num_registrations - self._num_pool_registrations_logged
+        self._num_pool_registrations_logged = pool.num_registrations
+        return [
+            # 0 once the pool has a free buffer for every size it sees.
+            m.Metric("rollout_worker/pool_registrations", m.Sum(new_registrations)),
+            m.Metric("rollout_worker/pool_bytes", m.Max(pool.registered_bytes)),
+            # The pool's buffers handed out and not yet released, size-class rounded.
+            m.Metric("rollout_worker/pool_bytes_in_use", m.Max(pool.bytes_in_use)),
+        ]
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:

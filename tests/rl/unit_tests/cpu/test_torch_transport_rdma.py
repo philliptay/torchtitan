@@ -184,24 +184,6 @@ def test_released_buffers_stay_registered() -> None:
     assert owner.pool.free_bytes == owner.pool.registered_bytes
 
 
-def test_pool_metrics_count_each_registration_once() -> None:
-    owner, _ = loopback_buffers()
-    _, handle = owner.allocate(4 * MiB)
-    owner.allocate(1 * MiB)
-    owner.release(handle)
-
-    def values() -> dict[str, float]:
-        return {metric.key: metric.value.value for metric in owner.pool_metrics()}
-
-    assert values() == {
-        "rollout_worker/pool_registrations": 2,
-        "rollout_worker/pool_bytes": 5 * MiB,
-        "rollout_worker/pool_bytes_in_use": 1 * MiB,
-    }
-    owner.allocate(4 * MiB)  # reuses the released buffer
-    assert values()["rollout_worker/pool_registrations"] == 0
-
-
 def test_a_read_whose_later_submission_raises_waits_for_the_reads_already_submitted() -> (
     None
 ):

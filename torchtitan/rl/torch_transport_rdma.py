@@ -41,8 +41,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from torchtitan.rl.observability import metrics as m
-
 # TODO: torch.distributed._transport is a private upstream API; switch to a public one once it
 # exists (no upstream issue yet; the same TODO as in model_state_dict_transport.py).
 if TYPE_CHECKING:
@@ -223,23 +221,10 @@ class RDMAByteBuffers:
         self._url = transport.bind()
         self.pool = RegisteredBufferPool(transport)
         self._generations = itertools.count(1)
-        self._num_registrations_logged = 0
         self._connected_urls: set[bytes] = set()
         # The reader's staging buffer and its registration, grown when a read needs more. No
         # other process reads it, so replacing it (unregistering the old one) is safe.
         self._staging: tuple[torch.Tensor, Memory] | None = None
-
-    def pool_metrics(self) -> list[m.Metric]:
-        """The owner pool's size, for a rollout worker to log with each training group."""
-        new_registrations = self.pool.num_registrations - self._num_registrations_logged
-        self._num_registrations_logged = self.pool.num_registrations
-        return [
-            # 0 once the pool has a free buffer for every size it sees.
-            m.Metric("rollout_worker/pool_registrations", m.Sum(new_registrations)),
-            m.Metric("rollout_worker/pool_bytes", m.Max(self.pool.registered_bytes)),
-            # The pool's buffers handed out and not yet released, size-class rounded.
-            m.Metric("rollout_worker/pool_bytes_in_use", m.Max(self.pool.bytes_in_use)),
-        ]
 
     def allocate(self, num_bytes: int) -> tuple[torch.Tensor, RDMAByteBuffer]:
         """A writable uint8 tensor of `num_bytes` (a view of a pooled, registered buffer) and the

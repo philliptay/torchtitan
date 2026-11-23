@@ -24,6 +24,8 @@ from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import MessageEnvRolloutWorker, Rollouter
 
+from tests.rl.unit_tests.cpu.test_torch_transport_rdma import loopback_buffers
+
 
 class _ChooseRunGroupEndpoint:
     def __init__(self) -> None:
@@ -79,6 +81,28 @@ def test_rollout_worker_actor_builds_its_worker_and_inits_its_logger(
         assert init_calls == [{"source": "rl_rollout_worker", "rank": 2}]
 
     asyncio.run(run())
+
+
+def test_pool_metrics_count_each_registration_once() -> None:
+    """The worker logs its pool with each training group; each registration counts once."""
+    owner, _ = loopback_buffers()
+    actor = object.__new__(RolloutWorkerActor)
+    actor._rdma_byte_buffers = owner
+    actor._num_pool_registrations_logged = 0
+    _, handle = owner.allocate(4 << 20)
+    owner.allocate(1 << 20)
+    owner.release(handle)
+
+    def values() -> dict[str, float]:
+        return {metric.key: metric.value.value for metric in actor._pool_metrics()}
+
+    assert values() == {
+        "rollout_worker/pool_registrations": 2,
+        "rollout_worker/pool_bytes": 5 << 20,
+        "rollout_worker/pool_bytes_in_use": 1 << 20,
+    }
+    owner.allocate(4 << 20)  # reuses the released buffer
+    assert values()["rollout_worker/pool_registrations"] == 0
 
 
 class _SetupEndpoint:

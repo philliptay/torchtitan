@@ -323,8 +323,8 @@ class Generator(Configurable):
         # Set by `initialize_torchstore_client`: the event loop TorchStore reads run on.
         self._torchstore_loop: asyncio.AbstractEventLoop | None = None
         # Rank 0 reads the image files rollout workers kept (`RDMAPrompt`) on one thread: torch
-        # transport reads block, and one transport serves one thread. The transport is made on
-        # the first such prompt, so runs without kept files never start NIXL here.
+        # transport reads block, and one transport serves one thread. The transport is made by
+        # the setup probe (`check_rdma_probes`), so runs without the images knob never start NIXL.
         self._image_file_reader = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="image-file-reader"
         )
