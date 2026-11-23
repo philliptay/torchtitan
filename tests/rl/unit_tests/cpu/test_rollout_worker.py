@@ -289,9 +289,7 @@ def test_delta_prompts_rebuild_the_full_prompt_samples() -> None:
                 generate_fn=generate_fn,
                 release_session_fn=release_session_fn,
                 env=env,
-                image_files=RDMAImageFiles(
-                    buffers=None, min_bytes=None, group_id=0, generation=1
-                ),
+                image_files=RDMAImageFiles(buffers=None, min_bytes=None, group_id=0),
                 sampling=SamplingConfig(),
                 group_id=0,
                 rollout_id=rollout_id,
@@ -354,9 +352,7 @@ def test_rollout_sends_and_records_prompt_images() -> None:
             generate_fn=generate_fn,
             release_session_fn=release_session_fn,
             env=_ImageTokenEnv(),
-            image_files=RDMAImageFiles(
-                buffers=None, min_bytes=None, group_id=0, generation=1
-            ),
+            image_files=RDMAImageFiles(buffers=None, min_bytes=None, group_id=0),
             sampling=SamplingConfig(),
             group_id=0,
             rollout_id=0,

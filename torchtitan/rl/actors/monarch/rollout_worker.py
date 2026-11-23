@@ -121,7 +121,7 @@ class RolloutWorkerActor(Actor):
                 group_size=group_size,
                 sampling=sampling,
             )
-            return finish_rollout_group(
+            finished = finish_rollout_group(
                 group,
                 for_training=for_training,
                 encoder=self._encoder,
@@ -131,6 +131,12 @@ class RolloutWorkerActor(Actor):
                     else self._group_buffers.pack
                 ),
             )
+            if for_training and self._rdma_byte_buffers is not None:
+                # With either knob: the pool never shrinks, so its size is worth watching.
+                finished.summary.group.metrics.extend(
+                    self._rdma_byte_buffers.pool_metrics()
+                )
+            return finished
 
     @concurrent_endpoint
     async def release_groups(self, group_ids: list[int]) -> None:

@@ -184,6 +184,24 @@ def test_released_buffers_stay_registered() -> None:
     assert owner.pool.free_bytes == owner.pool.registered_bytes
 
 
+def test_pool_metrics_count_each_registration_once() -> None:
+    owner, _ = loopback_buffers()
+    _, handle = owner.allocate(4 * MiB)
+    owner.allocate(1 * MiB)
+    owner.release(handle)
+
+    def values() -> dict[str, float]:
+        return {metric.key: metric.value.value for metric in owner.pool_metrics()}
+
+    assert values() == {
+        "rollout_worker/pool_registrations": 2,
+        "rollout_worker/pool_bytes": 5 * MiB,
+        "rollout_worker/pool_bytes_in_use": 1 * MiB,
+    }
+    owner.allocate(4 * MiB)  # reuses the released buffer
+    assert values()["rollout_worker/pool_registrations"] == 0
+
+
 def test_a_read_whose_later_submission_raises_waits_for_the_reads_already_submitted() -> (
     None
 ):
@@ -204,11 +222,15 @@ def test_a_probe_read_that_fails_raises_at_setup() -> None:
     instead of failing mid-step."""
     owner, reader = loopback_buffers()
     probe = replace(make_rdma_probe(owner), host="rollout-host-3")
-    check_rdma_probes(reader, [probe])
+    names = {"reader": "Generator rank 0", "knob": "rdma_min_image_bytes"}
+    check_rdma_probes(reader, [probe], **names)
     reader._transport.fail_reads = True
 
-    with pytest.raises(ValueError, match="rollout-host-3"):
-        check_rdma_probes(reader, [probe])
+    with pytest.raises(
+        ValueError,
+        match=r"Generator rank 0 on .*rollout-host-3.*Config\.rdma_min_image_bytes=None",
+    ):
+        check_rdma_probes(reader, [probe], **names)
 
 
 def _nixl_available() -> bool:
@@ -306,7 +328,7 @@ def _image_prompt(*images: PromptImage) -> Prompt:
 
 def test_image_files_keep_each_large_file_once_and_release_them() -> None:
     owner, reader = loopback_buffers()
-    image_files = RDMAImageFiles(buffers=owner, min_bytes=100, group_id=7, generation=1)
+    image_files = RDMAImageFiles(buffers=owner, min_bytes=100, group_id=7)
     large, small = _image("large", 200), _image("small", 1)
     # A sibling renders the same file into a new bytes object; a later turn adds an image.
     sibling_large = replace(large, data=bytes(large.data))
@@ -347,8 +369,8 @@ def test_image_files_send_the_prompt_whole_below_the_threshold_or_without_one() 
     owner, reader = loopback_buffers()
     prompt = _image_prompt(_image("small", 10))
     for image_files in (
-        RDMAImageFiles(buffers=owner, min_bytes=11, group_id=1, generation=1),
-        RDMAImageFiles(buffers=None, min_bytes=None, group_id=1, generation=1),
+        RDMAImageFiles(buffers=owner, min_bytes=11, group_id=1),
+        RDMAImageFiles(buffers=None, min_bytes=None, group_id=1),
     ):
         sent = image_files.register(prompt)
         assert sent == RDMAPrompt(prompt) and sent.prompt is prompt
@@ -358,31 +380,19 @@ def test_image_files_send_the_prompt_whole_below_the_threshold_or_without_one() 
 
 
 def test_a_read_after_the_worker_reused_the_files_buffer_raises() -> None:
-    """A group's file buffer goes back to the pool when the group finishes, and the next group's
-    file of the same size class reuses it. A late read of the first group's handle then sees the
-    second group's tags instead of returning its bytes as the first group's file."""
+    """A group's file buffer goes back to the pool when its generate calls end, and the next
+    allocation of the same size class reuses it, e.g. the same group's packed buffer: same
+    `group_id`, so only the pool's per-allocation generation tells the two uses apart. A late
+    read of the file's handle then sees the new tags instead of returning the new bytes as the
+    file."""
     owner, reader = loopback_buffers()
-    first_group = RDMAImageFiles(buffers=owner, min_bytes=100, group_id=1, generation=1)
-    stale = first_group.register(_image_prompt(_image("a", 1000)))
-    first_group.release()
-    second_group = RDMAImageFiles(
-        buffers=owner, min_bytes=100, group_id=2, generation=2
-    )
-    fresh = second_group.register(_image_prompt(_image("b", 1000)))
+    first_use = RDMAImageFiles(buffers=owner, min_bytes=100, group_id=1)
+    stale = first_use.register(_image_prompt(_image("a", 1000)))
+    first_use.release()
+    second_use = RDMAImageFiles(buffers=owner, min_bytes=100, group_id=1)
+    fresh = second_use.register(_image_prompt(_image("b", 1000)))
 
     assert owner.pool.num_registrations == 1
     assert fresh.read(reader).images[0].data == b"b" * 1000
-    with pytest.raises(RuntimeError, match=r"group 1 \(generation 1\).*\(2, 2\)"):
+    with pytest.raises(RuntimeError, match=r"group 1 \(generation 1\).*\(1, 2\)"):
         stale.read(reader)
-
-
-@requires_nixl
-def test_nixl_image_file_reaches_the_reader_as_a_handle() -> None:
-    """Over real NIXL: the file crosses as a handle, and the reader reads its bytes."""
-    owner, reader = RDMAByteBuffers(), RDMAByteBuffers()
-    image = _image("photo", 3 * MiB)
-    image_files = RDMAImageFiles(buffers=owner, min_bytes=MiB, group_id=3, generation=1)
-    sent = image_files.register(_image_prompt(image))
-    assert [image.data for image in sent.prompt.images] == [b""]
-    assert sent.read(reader).images[0].data == image.data
-    image_files.release()

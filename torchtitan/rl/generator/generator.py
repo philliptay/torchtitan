@@ -43,7 +43,12 @@ from torchtitan.rl.model_state_dict_transport import (
 )
 from torchtitan.rl.rollout.types import Completion, Prompt
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
-from torchtitan.rl.torch_transport_rdma import RDMAByteBuffers, RDMAPrompt
+from torchtitan.rl.torch_transport_rdma import (
+    check_rdma_probes,
+    RDMAByteBuffers,
+    RDMAProbe,
+    RDMAPrompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -468,9 +473,30 @@ class Generator(Configurable):
             )
 
     def _read_prompt_on_reader_thread(self, prompt: RDMAPrompt) -> Prompt:
+        return prompt.read(self._image_file_buffers_on_reader_thread())
+
+    def _image_file_buffers_on_reader_thread(self) -> RDMAByteBuffers:
         if self._image_file_buffers is None:
             self._image_file_buffers = RDMAByteBuffers()
-        return prompt.read(self._image_file_buffers)
+        return self._image_file_buffers
+
+    async def check_rdma_probes(self, probes: list[RDMAProbe]) -> None:
+        """On rank 0, at setup when prompt image files go by RDMA: read each rollout worker's
+        probe on the image-file thread (`check_rdma_probes`), which also makes this rank's
+        transport and connects it to every worker.
+
+        Raises:
+            ValueError: a probe read failed; the message names the hosts.
+        """
+        await asyncio.get_running_loop().run_in_executor(
+            self._image_file_reader,
+            lambda: check_rdma_probes(
+                self._image_file_buffers_on_reader_thread(),
+                probes,
+                reader="Generator rank 0",
+                knob="rdma_min_image_bytes",
+            ),
+        )
 
     async def release_groups(self, group_ids: list[int]) -> None:
         """Drop the pinned cache salts and the held KV of finished rollout groups.

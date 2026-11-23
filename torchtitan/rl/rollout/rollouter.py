@@ -417,8 +417,6 @@ class BaseRolloutWorker(Configurable, ABC):
         self._rdma_byte_buffers = (
             rdma_byte_buffers if config.rdma_min_image_bytes is not None else None
         )
-        # Tags each group's kept image files (`RDMAImageFiles`), so a stale read is caught.
-        self._image_file_generations = itertools.count(1)
         self.rubric: Rubric = config.rubric.build()
         self.advantage_estimator: AdvantageEstimator = config.advantage.build()
 
@@ -568,7 +566,6 @@ class MessageEnvRolloutWorker(BaseRolloutWorker):
             buffers=self._rdma_byte_buffers,
             min_bytes=self._rdma_min_image_bytes,
             group_id=group_id,
-            generation=next(self._image_file_generations),
         )
         # TODO(perf): siblings in a group share the first-turn prompt; tokenize it once per group and
         # reuse across the group_size rollouts (truest spot is the worker's first-turn render).

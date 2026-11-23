@@ -30,6 +30,7 @@ unregisters keeps every buffer a reader has loaded valid.
 
 from __future__ import annotations
 
+import itertools
 import os
 import socket
 import struct
@@ -40,6 +41,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+from torchtitan.rl.observability import metrics as m
+
 # TODO: torch.distributed._transport is a private upstream API; switch to a public one once it
 # exists (no upstream issue yet; the same TODO as in model_state_dict_transport.py).
 if TYPE_CHECKING:
@@ -49,6 +52,11 @@ if TYPE_CHECKING:
 
 # The smallest buffer the pool registers; smaller requests share its size.
 _MIN_BUFFER_BYTES = 64 * 1024
+
+# What an owner writes before and after each region a reader must tell from a later use of the
+# same pooled buffer: (group_id, `RDMAByteBuffer.generation`). Image files and packed groups share
+# the pool, so the generation, stamped per allocation, is what makes a tag name one use.
+REGION_TAG = struct.Struct("<qq")
 
 
 def buffer_size_class(num_bytes: int) -> int:
@@ -172,6 +180,10 @@ class RDMAByteBuffer:
     buffer_index: int
     """The buffer's index in the owner's `RegisteredBufferPool`."""
 
+    generation: int
+    """The owner's count of allocations, so it names this use of the pooled buffer: readers check
+    it in the region tags (`REGION_TAG`)."""
+
 
 class RDMAByteBuffers:
     """One process's torch transport and its `RegisteredBufferPool`: as an owner it hands out
@@ -210,10 +222,24 @@ class RDMAByteBuffers:
         self._transport = transport
         self._url = transport.bind()
         self.pool = RegisteredBufferPool(transport)
+        self._generations = itertools.count(1)
+        self._num_registrations_logged = 0
         self._connected_urls: set[bytes] = set()
         # The reader's staging buffer and its registration, grown when a read needs more. No
         # other process reads it, so replacing it (unregistering the old one) is safe.
         self._staging: tuple[torch.Tensor, Memory] | None = None
+
+    def pool_metrics(self) -> list[m.Metric]:
+        """The owner pool's size, for a rollout worker to log with each training group."""
+        new_registrations = self.pool.num_registrations - self._num_registrations_logged
+        self._num_registrations_logged = self.pool.num_registrations
+        return [
+            # 0 once the pool has a free buffer for every size it sees.
+            m.Metric("rollout_worker/pool_registrations", m.Sum(new_registrations)),
+            m.Metric("rollout_worker/pool_bytes", m.Max(self.pool.registered_bytes)),
+            # The pool's buffers handed out and not yet released, size-class rounded.
+            m.Metric("rollout_worker/pool_bytes_in_use", m.Max(self.pool.bytes_in_use)),
+        ]
 
     def allocate(self, num_bytes: int) -> tuple[torch.Tensor, RDMAByteBuffer]:
         """A writable uint8 tensor of `num_bytes` (a view of a pooled, registered buffer) and the
@@ -225,6 +251,7 @@ class RDMAByteBuffers:
             remote_buffer=pooled.remote_buffer,
             num_bytes=num_bytes,
             buffer_index=index,
+            generation=next(self._generations),
         )
         return pooled.tensor[:num_bytes], handle
 
@@ -297,8 +324,9 @@ _PROBE_BYTES = bytes(range(256)) * 16
 
 @dataclass(frozen=True, slots=True)
 class RDMAProbe:
-    """A small buffer a rollout worker allocates at setup, so every trainer DP replica leader can
-    check that it reads that worker's buffers before the first step (`check_rdma_probes`)."""
+    """A small buffer a rollout worker allocates at setup, so each reader of its buffers (every
+    trainer DP replica leader for packed groups, rank 0 of every generator for prompt image
+    files) checks that it reads them before the first step (`check_rdma_probes`)."""
 
     host: str
 
@@ -312,9 +340,16 @@ def make_rdma_probe(buffers: RDMAByteBuffers) -> RDMAProbe:
     return RDMAProbe(host=socket.gethostname(), buffer=handle)
 
 
-def check_rdma_probes(buffers: RDMAByteBuffers, probes: Sequence[RDMAProbe]) -> None:
+def check_rdma_probes(
+    buffers: RDMAByteBuffers, probes: Sequence[RDMAProbe], *, reader: str, knob: str
+) -> None:
     """Read each probe whole and at a non-zero offset, and check the bytes. This also connects
     this reader to every owner, so the first step pays no connection cost.
+
+    Args:
+        reader: who reads, for the error, e.g. "The trainer DP replica leader".
+        knob: the `BaseRolloutWorker.Config` field that turns this reader's RDMA path off, for
+            the error, e.g. "rdma_min_group_bytes".
 
     Raises:
         ValueError: a read failed or returned wrong bytes. A host can report RDMA hardware and
@@ -337,33 +372,33 @@ def check_rdma_probes(buffers: RDMAByteBuffers, probes: Sequence[RDMAProbe]) -> 
             failures.append(f"from {probe.host}: wrong bytes")
     if failures:
         raise ValueError(
-            f"The trainer DP replica leader on {socket.gethostname()} "
-            f"(UCX_TLS={os.environ.get('UCX_TLS')}) cannot read rollout worker buffers over "
-            f"torch transport: {'; '.join(failures)}. Set "
-            "BaseRolloutWorker.Config.rdma_min_group_bytes=None to send rollout groups by value."
+            f"{reader} on {socket.gethostname()} (UCX_TLS={os.environ.get('UCX_TLS')}) cannot "
+            f"read rollout worker buffers over torch transport: {'; '.join(failures)}. Set "
+            f"BaseRolloutWorker.Config.{knob}=None to send these values in the calls instead."
         )
-
-
-# What a rollout worker writes before and after each image file it keeps: (group_id, generation).
-_IMAGE_FILE_TAG = struct.Struct("<qq")
 
 
 @dataclass(frozen=True, slots=True)
 class RDMAImageFile:
     """A prompt image file kept in its rollout worker's registered buffer, laid out as
-    `| tag | file | tag |` with tag `(group_id, generation)`. The tags catch a read made after the
-    worker reused the buffer; the release order rules out a read racing the reuse (the worker
-    releases a group's files only after the group's last generate call has returned, and the
-    generator reads them before it generates)."""
+    `| tag | file | tag |` with tag `(group_id, buffer.generation)` (`REGION_TAG`). The tags catch
+    a read made after the worker reused the buffer; the release order rules out a read racing the
+    reuse (the worker releases a group's files only after the group's last generate call has
+    returned, and the generator reads them before it generates).
+
+    TODO: that order holds because nothing cancels a generate call (`Controller._make_generate_fn`).
+    If something does, a read racing the reuse can pass the tag check with a torn middle, and the
+    engine would cache the pixels under `hash_value`; release only after rank 0's read returns.
+    """
 
     buffer: RDMAByteBuffer
     """Both tags and the file."""
 
     group_id: int
 
-    generation: int
-    """The worker's count of groups that kept files, so `(group_id, generation)` names one use of
-    a pooled buffer."""
+    @property
+    def generation(self) -> int:
+        return self.buffer.generation
 
     def file_bytes(self, data: np.ndarray) -> bytes:
         """The file, from the bytes read from `buffer`.
@@ -372,16 +407,16 @@ class RDMAImageFile:
             RuntimeError: the tags differ from this file's, i.e. the worker reused the buffer
                 before this read (a bug in the release order).
         """
-        tag = _IMAGE_FILE_TAG.pack(self.group_id, self.generation)
-        head = data[: _IMAGE_FILE_TAG.size].tobytes()
-        tail = data[-_IMAGE_FILE_TAG.size :].tobytes()
+        tag = REGION_TAG.pack(self.group_id, self.generation)
+        head = data[: REGION_TAG.size].tobytes()
+        tail = data[-REGION_TAG.size :].tobytes()
         if head != tag or tail != tag:
             raise RuntimeError(
                 f"Image file of rollout group {self.group_id} (generation {self.generation}): "
-                f"its buffer holds {_IMAGE_FILE_TAG.unpack(head)} ... "
-                f"{_IMAGE_FILE_TAG.unpack(tail)}, so the rollout worker reused it before this read."
+                f"its buffer holds {REGION_TAG.unpack(head)} ... "
+                f"{REGION_TAG.unpack(tail)}, so the rollout worker reused it before this read."
             )
-        return data[_IMAGE_FILE_TAG.size : -_IMAGE_FILE_TAG.size].tobytes()
+        return data[REGION_TAG.size : -REGION_TAG.size].tobytes()
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,8 +425,7 @@ class RDMAPrompt:
     the rollout worker, and the rest of the prompt by value. Without them, it is the whole prompt.
 
     Example:
-        image_files = RDMAImageFiles(buffers=worker_buffers, min_bytes=1 << 20, group_id=7,
-                                     generation=3)
+        image_files = RDMAImageFiles(buffers=worker_buffers, min_bytes=1 << 20, group_id=7)
         rdma_prompt = image_files.register(prompt)          # rollout worker: a 5 MB file stays
         prompt = rdma_prompt.read(generator_buffers)        # generator rank 0: one read call
         image_files.release()                               # rollout worker, after the group's
@@ -455,16 +489,11 @@ class RDMAImageFiles:
         buffers: RDMAByteBuffers | None,
         min_bytes: int | None,
         group_id: int,
-        generation: int,
     ) -> None:
         assert (buffers is None) == (min_bytes is None)
         self._buffers = buffers
         self._min_bytes = min_bytes
-        self._tag = np.frombuffer(
-            _IMAGE_FILE_TAG.pack(group_id, generation), dtype=np.uint8
-        )
         self._group_id = group_id
-        self._generation = generation
         self._files: dict[str, RDMAImageFile] = {}
         self._released = False
 
@@ -512,12 +541,13 @@ class RDMAImageFiles:
 
     def _keep(self, data: bytes) -> RDMAImageFile:
         assert self._buffers is not None
-        tag_bytes = _IMAGE_FILE_TAG.size
+        tag_bytes = REGION_TAG.size
         tensor, buffer = self._buffers.allocate(len(data) + 2 * tag_bytes)
-        destination = tensor.numpy()
-        destination[:tag_bytes] = self._tag
-        destination[tag_bytes:-tag_bytes] = np.frombuffer(data, dtype=np.uint8)
-        destination[-tag_bytes:] = self._tag
-        return RDMAImageFile(
-            buffer=buffer, group_id=self._group_id, generation=self._generation
+        tag = np.frombuffer(
+            REGION_TAG.pack(self._group_id, buffer.generation), dtype=np.uint8
         )
+        destination = tensor.numpy()
+        destination[:tag_bytes] = tag
+        destination[tag_bytes:-tag_bytes] = np.frombuffer(data, dtype=np.uint8)
+        destination[-tag_bytes:] = tag
+        return RDMAImageFile(buffer=buffer, group_id=self._group_id)

@@ -190,9 +190,7 @@ def test_rollout_keeps_each_image_on_its_placeholders(
             generate_fn=generate_fn,
             release_session_fn=release_session_fn,
             env=env,
-            image_files=RDMAImageFiles(
-                buffers=None, min_bytes=None, group_id=0, generation=1
-            ),
+            image_files=RDMAImageFiles(buffers=None, min_bytes=None, group_id=0),
             sampling=SamplingConfig(),
             group_id=0,
             rollout_id=0,
