@@ -38,7 +38,7 @@ import numpy as np
 import torch
 
 # TODO: torch.distributed._transport is a private upstream API; switch to a public one once it
-# exists (no upstream issue yet).
+# exists (no upstream issue yet; the same TODO as in model_state_dict_transport.py).
 if TYPE_CHECKING:
     from torch.distributed._transport import Memory, RemoteBuffer, Transport
 
@@ -77,10 +77,9 @@ class _PooledBuffer:
 
 
 # TODO: free idle buffers once torch transport invalidates a reader's loaded sections when their
-# owner unregisters them. Today it does not (module docstring), so freeing a buffer a reader has
-# read can make a later buffer at the same addresses unreadable; that is why this pool never
-# unregisters, and why its memory never shrinks. A pytorch/pytorch issue is to be filed; add its
-# link here.
+# owner unregisters them (https://github.com/pytorch/pytorch/issues/206300). Today it does not
+# (module docstring), so freeing a buffer a reader has read can make a later buffer at the same
+# addresses unreadable; that is why this pool never unregisters, and why its memory never shrinks.
 class RegisteredBufferPool:
     """uint8 CPU buffers registered with one transport, handed out and taken back, and never
     unregistered: a released buffer waits on its size class's free list for a later request of
