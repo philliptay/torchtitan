@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
     # Type-only: importing the generator module here would pull in vLLM at import time.
     from torchtitan.rl.generator.types import SamplingConfig
+    from torchtitan.rl.torch_transport_rdma import RDMAProbe
 
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,21 @@ class Rollouter(Configurable):
         if self._worker_actors is not None:
             await self._worker_actors.sync_log_step.call(step)
 
+    def release_groups(self, group_ids: list[int]) -> None:
+        """Tell every rollout worker that these groups are released: the worker that keeps each
+        one returns its buffer to its pool. One-way, not awaited."""
+        assert self._worker_actors is not None
+        self._worker_actors.release_groups.broadcast(group_ids)
+
+    async def make_rdma_probes(self) -> list[RDMAProbe]:
+        """One probe buffer per rollout worker (`check_rdma_probes`)."""
+        assert self._worker_actors is not None
+        return list((await self._worker_actors.make_rdma_probe.call()).values())
+
+    async def drop_rdma_probes(self) -> None:
+        assert self._worker_actors is not None
+        await self._worker_actors.drop_rdma_probe.call()
+
     async def run_group_rollouts(
         self,
         *,
@@ -347,11 +363,35 @@ class BaseRolloutWorker(Configurable, ABC):
         hosts with ibverbs, reading broke even with sending at ~2 MB per file, was ~2x faster
         from 5 MB, and 2-6x slower below 1 MB (e.g. Geometry3K's ~15 KB files)."""
 
+        rdma_min_group_bytes: int | None = None
+        """Keep each training group whose packed bytes (`pack_rollout_group`) are at least this
+        many in this worker, in one registered buffer, and send a handle instead of the bytes;
+        each trainer DP replica leader reads only the rollouts it trains on, over torch transport
+        (NIXL). The worker keeps the buffer until the weight pull after the step that trains the
+        group, then reuses it for a later group:
+            None (default): every group by value, worker -> controller -> leaders.
+            e.g. 1 << 20: groups of >= 1 MiB by RDMA, smaller ones by value.
+        Use it for groups of MBs: score-centering top-k logprobs at long completions (k=32:
+        17 MB per 16-rollout group at 4K tokens), routed experts, or images; the controller then
+        moves none of their bytes. Keep small groups by value: a leader reads every group of its
+        column before its first microbatch, and at 1, alphabet sort's 4.6 KB groups (256 per
+        step) added ~95 ms to that wait; ~1 MiB is a reasonable threshold.
+        Needs torch transport in every rollout worker and trainer DP replica leader; setup reads
+        a probe from each worker on each leader and raises if a read fails or does not finish.
+        A worker's pool never shrinks: for each buffer size class (steps of at most 25%) it
+        keeps the most buffers that class ever had in use at once, usually reached in the first
+        steps, when every rollout slot fills before the first release."""
+
         def __post_init__(self) -> None:
             if self.rdma_min_image_bytes is not None and self.rdma_min_image_bytes < 1:
                 raise ValueError(
                     "rdma_min_image_bytes must be None or >= 1 (RDMABuffer rejects empty "
                     f"buffers), got {self.rdma_min_image_bytes}"
+                )
+            if self.rdma_min_group_bytes is not None and self.rdma_min_group_bytes < 1:
+                raise ValueError(
+                    "rdma_min_group_bytes must be None or >= 1, got "
+                    f"{self.rdma_min_group_bytes}"
                 )
 
     def __init__(
