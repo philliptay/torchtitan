@@ -16,6 +16,7 @@ from typing import Any, cast, Literal, NoReturn, overload
 
 import torch
 from torch import Tensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import _StridedShard
@@ -54,26 +55,7 @@ from .optimizer_reshard import (
 
 __all__ = [
     "DistMuon",
-    "redistribution_mesh_axes",
 ]
-
-
-def redistribution_mesh_axes(
-    fqn: str, param: DTensor, compute_layout: ComputeLayout
-) -> tuple[str, ...]:
-    """Return the ordered storage-axis names needed for this Muon transition.
-
-    This construction-time query resolves the transport axes with the same
-    rules as DistMuon's planner, without allocating buffers or creating
-    communicators. An empty tuple means storage already contains complete
-    compute matrices.
-    """
-    resolved = _resolve_storage_to_compute_transition(fqn, param, compute_layout)
-    mesh_axis_names = param.device_mesh.mesh_dim_names
-    assert mesh_axis_names is not None
-    return tuple(
-        mesh_axis_names[axis] for axis in resolved.redistribution_storage_mesh_axes
-    )
 
 
 _NSCoefficients = tuple[float, float, float]
@@ -152,6 +134,7 @@ def _initialize_dist_muon(
     *,
     compute_sharding_by_fqn: Mapping[str, ComputeLayout],
     bucket_configs: Sequence[BucketConfig],
+    transport_meshes: Sequence[DeviceMesh],
 ) -> None:
     """Initialize FlexShard for one newly constructed DistMuon.
 
@@ -162,6 +145,8 @@ def _initialize_dist_muon(
     frozen because optimizer state and collectives depend on them.
     """
     _validate_compute_sharding_configuration(compute_sharding_by_fqn)
+    if any(mesh.ndim != 1 for mesh in transport_meshes):
+        raise ValueError("DistMuon transport_meshes must be one-dimensional")
 
     for param_group in optimizer.param_groups:
         for fqn in param_group["param_names"]:
@@ -181,6 +166,7 @@ def _initialize_dist_muon(
         get_redistribution_storage_mesh_axes=lambda layout: (
             layout.redistribution_storage_mesh_axes
         ),
+        transport_meshes=transport_meshes,
     )
     optimizer._initialize_plan(compute_layouts)
     optimizer._validate_plan_across_ranks()
@@ -202,12 +188,14 @@ class DistMuon(Optimizer):
     have a layout-compatible DTensor gradient before each rank enters
     ``step()``.
 
-    Callers construct dedicated transport meshes and supply them through
-    ``BucketConfig.mesh``. A single-axis bucket without an explicit mesh reuses
-    its storage group. Combined transports require an explicit 1D mesh with
-    the same storage ranks and order. Construction and checkpoint loading reuse
-    the bound groups; DistMuon does not create communicators or choose their
-    initialization options.
+    ``transport_meshes`` is a pool of caller-owned 1D meshes. Each bucket
+    uses the mesh whose ranks equal the storage ranks of its transport axes,
+    in storage order, for example a ``dp_shard_tp`` mesh for a bucket that
+    redistributes over ``(dp_shard, tp)``. Without a matching mesh, a
+    single-axis transport reuses its storage group and a combined transport
+    raises. Construction and checkpoint loading reuse the bound groups;
+    DistMuon does not create communicators or choose their initialization
+    options.
 
     Matrix-batch compute views use batched BF16 kernels. They implement the
     same mathematical update as ``torch.optim.Muon`` running one matrix at a
@@ -244,6 +232,7 @@ class DistMuon(Optimizer):
         *,
         compute_sharding_by_fqn: Mapping[str, ComputeLayout],
         bucket_configs: Sequence[BucketConfig],
+        transport_meshes: Sequence[DeviceMesh] = (),
         lr: float = 1e-3,
         weight_decay: float = 0.1,
         momentum: float = 0.95,
@@ -274,6 +263,7 @@ class DistMuon(Optimizer):
             self,
             compute_sharding_by_fqn=compute_sharding_by_fqn,
             bucket_configs=bucket_configs,
+            transport_meshes=transport_meshes,
         )
 
     @staticmethod

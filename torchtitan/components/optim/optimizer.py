@@ -6,20 +6,19 @@
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import re
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, replace
-from typing import Any, cast, Literal, overload
+from dataclasses import dataclass, field
+from typing import Any, cast, Literal, overload, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
 from torch.optim import Optimizer
 
 from torchtitan.components.checkpointer.utils import canonical_fqn
@@ -28,15 +27,16 @@ from torchtitan.distributed.flex_shard import (
     BucketConfig,
     ComputeLayout,
     DistMuon as FlexShardDistMuon,
-    redistribution_mesh_axes,
 )
-from torchtitan.distributed.utils import build_transport_meshes
 
 from .utils import (
     get_flat_optim_state_dict,
     init_optim_state,
     load_flat_optim_state_dict,
 )
+
+if TYPE_CHECKING:
+    from torchtitan.distributed import ParallelismContext
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,7 @@ class Adam(torch.optim.Adam, BaseOptimizer):
         config: Config,
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
+        parallelism_context: ParallelismContext | None = None,
     ) -> None:
         super().__init__(
             params,
@@ -175,6 +176,7 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
         config: Config,
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
+        parallelism_context: ParallelismContext | None = None,
     ) -> None:
         super().__init__(
             params,
@@ -192,18 +194,23 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
 class DistMuon(FlexShardDistMuon, BaseOptimizer):
     """Configurable TorchTitan wrapper around FlexShard's ``DistMuon``.
 
+    Combined DP/TP transports need their own process groups. This wrapper
+    requests them from ``parallelism_context.new_group_meshes``, which creates
+    every slice on every rank, and passes them to FlexShard as
+    ``transport_meshes``; FlexShard picks each bucket's mesh by rank set. The
+    requested axes depend only on the parallelism degrees, so every rank makes
+    the same calls whichever pipeline stage it owns:
+
+    - ``(dp_shard, tp)``, or ``(dp_shard, cp, tp)`` under CP, when TP > 1;
+    - with the CTA cap, also ``(dp_shard,)`` or ``(dp_shard, cp)``, and
+      ``(edp_shard,)`` when EP > 1, so single-axis transports get capped
+      communicators too.
+
     Note:
         The CTA cap is disabled by default because it is a workload-dependent
-        memory/performance tradeoff. Enabling it builds explicit redistribution
-        meshes backed by separate, resource-independent NCCL communicators and
-        passes them through ``BucketConfig``. Each communicator adds fixed
+        memory/performance tradeoff. Each capped communicator adds fixed
         memory and may reduce throughput; the cap benefits workloads only when
         the reduction in all-peer connection state outweighs that overhead.
-        Recipes leave ``BucketConfig.mesh`` unset: process groups do not exist
-        when a recipe is written. This wrapper builds each bucket's transport
-        mesh from the storage layout (see ``build_transport_meshes``), which
-        requires every rank to construct the same sequence of DistMuon
-        optimizers.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -251,55 +258,57 @@ class DistMuon(FlexShardDistMuon, BaseOptimizer):
         config: Config,
         *,
         params: Iterable[dict[str, Any]] | Iterable[Tensor],
+        parallelism_context: ParallelismContext | None = None,
     ) -> None:
-        param_groups = tuple(cast(Iterable[dict[str, Any]], params))
-        named_parameters = [
-            (fqn, param)
-            for group in param_groups
-            for fqn, param in zip(group["param_names"], group["params"], strict=True)
-            if isinstance(param, DTensor)
-        ]
         max_ctas = (
             config.max_nccl_ctas_for_comms
             if config.max_nccl_ctas_for_comms > 0
             else None
         )
-        if max_ctas is not None and dist.get_backend() == "fake":
+        default_backend = dist.get_backend() if dist.is_initialized() else None
+        if max_ctas is not None and default_backend == "fake":
             warnings.warn(
                 "Redistribution max_ctas is not modeled by the fake process "
                 "group; building transport meshes without the cap",
                 stacklevel=2,
             )
             max_ctas = None
-        # Storage mesh and transport axes of each bucket's first parameter
-        # that needs redistribution; FlexShard rejects mixed transports.
-        transports = []
-        for bucket in config.bucket_configs:
-            if bucket.mesh is not None:
+        transport_meshes: tuple[DeviceMesh, ...] = ()
+        if parallelism_context is None:
+            if max_ctas is not None:
                 raise ValueError(
-                    f"BucketConfig {bucket.patterns} sets mesh; the TorchTitan "
-                    "DistMuon wrapper builds every bucket's transport mesh"
+                    "max_nccl_ctas_for_comms requires a parallelism_context"
                 )
-            transport = None
-            for fqn, param in named_parameters:
-                layout = config.compute_sharding_by_fqn.get(fqn)
-                if layout is None or not any(
-                    fnmatch.fnmatchcase(fqn, pattern) for pattern in bucket.patterns
-                ):
-                    continue
-                if axes := redistribution_mesh_axes(fqn, param, layout):
-                    transport = (param.device_mesh, axes)
-                    break
-            transports.append(transport)
-        meshes = build_transport_meshes(transports, max_ctas=max_ctas)
-        bucket_configs = tuple(
-            bucket if mesh is None else replace(bucket, mesh=mesh)
-            for bucket, mesh in zip(config.bucket_configs, meshes, strict=True)
-        )
+        else:
+            dense_shard_axes: tuple[str, ...] = (
+                ("dp_shard", "cp") if parallelism_context.cp > 1 else ("dp_shard",)
+            )
+            axes_list: list[tuple[str, ...]] = []
+            if parallelism_context.tp > 1:
+                axes_list.append((*dense_shard_axes, "tp"))
+            backend = pg_options = None
+            if max_ctas is not None:
+                if default_backend is None or dist.Backend.NCCL not in default_backend:
+                    raise ValueError(
+                        f"max_nccl_ctas_for_comms requires NCCL, got {default_backend!r}"
+                    )
+                axes_list.append(dense_shard_axes)
+                if parallelism_context.ep > 1:
+                    axes_list.append(("edp_shard",))
+                backend = dist.Backend.NCCL
+                pg_options = dist.ProcessGroupNCCL.Options()
+                pg_options.config.max_ctas = max_ctas
+                pg_options.config.split_share = 0  # pyrefly: ignore [missing-attribute]
+            transport_meshes = tuple(
+                parallelism_context.new_group_meshes(
+                    axes_list, backend=backend, pg_options=pg_options
+                ).values()
+            )
         super().__init__(
-            param_groups,
+            cast(Iterable[dict[str, Any]], params),
             compute_sharding_by_fqn=config.compute_sharding_by_fqn,
-            bucket_configs=bucket_configs,
+            bucket_configs=config.bucket_configs,
+            transport_meshes=transport_meshes,
             lr=config.lr,
             weight_decay=config.weight_decay,
             momentum=config.momentum,
@@ -330,6 +339,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
     Args:
         config (Config): Ordered optimizer configurations.
         model_parts (List[nn.Module]): List of model parts to be optimized.
+        parallelism_context: Passed to every optimizer build, for optimizers
+            that create their own communication groups (e.g. ``DistMuon``).
+            Optional for builds without a device mesh.
         enable_accelerator_graph: Prepare every optimizer for accelerator graph capture.
     """
 
@@ -375,6 +387,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
         config: Config,
         *,
         model_parts: list[nn.Module],
+        parallelism_context: ParallelismContext | None = None,
         enable_accelerator_graph: bool = False,
     ) -> None:
         all_params: list[nn.Parameter] = []
@@ -389,7 +402,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
                     optimizer_config,
                     claimed,
                 )
-                optimizer = optimizer_config.build(params=[param_group])
+                optimizer = optimizer_config.build(
+                    params=[param_group], parallelism_context=parallelism_context
+                )
                 if enable_accelerator_graph:
                     if any(
                         "capturable" not in group for group in optimizer.param_groups

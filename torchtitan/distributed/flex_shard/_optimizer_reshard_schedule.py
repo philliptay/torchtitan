@@ -40,12 +40,14 @@ def _bind_bucket_configs(
     get_storage_dtensor: Callable[[_ItemT], DTensor],
     requires_redistribution: Callable[[_ItemT], bool],
     get_redistribution_storage_mesh_axes: Callable[[_ItemT], tuple[int, ...]],
+    transport_meshes: Sequence[DeviceMesh],
 ) -> tuple[_BucketSpec, ...]:
     """Bind configs after each item's redistribution requirement is resolved.
 
-    Redistributed items determine the communication axes. An explicit bucket
-    mesh may replace their process group while preserving the layout. An
-    entirely local bucket remains mesh-free.
+    Redistributed items determine the communication axes. A transport mesh
+    whose ranks equal the storage ranks of those axes, in storage order,
+    replaces their process group. Without one, a single axis uses its storage
+    group and combined axes raise. An entirely local bucket remains mesh-free.
     """
     specs = []
     for config in configs:
@@ -105,46 +107,26 @@ def _bind_bucket_configs(
                 f"bucket {config.name!r} requires heterogeneous transport groups; "
                 "split its BucketConfig patterns"
             )
-        if config.mesh is not None:
-            configured_axis_names = config.mesh.mesh_dim_names
-            if configured_axis_names == ("_".join(transport_axis_names),):
-                configured_transport_mesh = config.mesh
-            elif configured_axis_names is None or any(
-                axis_name not in configured_axis_names
-                for axis_name in transport_axis_names
-            ):
-                raise ValueError(
-                    f"bucket {config.name!r} mesh is missing redistribution axis "
-                    f"names {transport_axis_names!r}"
-                )
-            else:
-                configured_transport_mesh = config.mesh[
-                    transport_axis_names[0]
-                    if len(transport_axis_names) == 1
-                    else transport_axis_names
-                ]
-            if configured_transport_mesh.ndim > 1:
-                raise ValueError(
-                    f"bucket {config.name!r} requires a 1D mesh for its combined "
-                    f"transport axes {transport_axis_names!r}; flatten it before "
-                    "constructing DistMuon"
-                )
-            if not torch.equal(
-                configured_transport_mesh.mesh.flatten(),
-                storage_transport_ranks.flatten(),
-            ):
-                raise ValueError(
-                    f"bucket {config.name!r} mesh for axes {transport_axis_names!r} "
-                    "does not match the parameter storage mesh layout"
-                )
-            selected_transport_mesh = configured_transport_mesh
-        else:
-            if len(transport_axis_names) != 1:
-                raise ValueError(
-                    f"bucket {config.name!r} requires an explicit BucketConfig.mesh "
-                    f"for combined transport axes {transport_axis_names!r}"
-                )
+        matching_meshes = [
+            mesh
+            for mesh in transport_meshes
+            if torch.equal(mesh.mesh, storage_transport_ranks.flatten())
+        ]
+        if len(matching_meshes) > 1:
+            raise ValueError(
+                f"bucket {config.name!r} matches several transport meshes for "
+                f"axes {transport_axis_names!r}"
+            )
+        if matching_meshes:
+            selected_transport_mesh = matching_meshes[0]
+        elif len(transport_axis_names) == 1:
             selected_transport_mesh = storage_mesh[transport_axis_names[0]]
+        else:
+            raise ValueError(
+                f"bucket {config.name!r} needs a transport mesh for combined "
+                f"axes {transport_axis_names!r}; pass a 1D mesh with their "
+                "storage ranks in DistMuon's transport_meshes"
+            )
         specs.append(config._bind(selected_transport_mesh))
     return tuple(specs)
 

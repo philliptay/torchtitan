@@ -7,10 +7,11 @@
 """CPU checks for DistMuon DP x TP layouts and pipeline transport creation."""
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import distribute_tensor, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
@@ -32,7 +33,7 @@ from torchtitan.distributed.flex_shard.dist_muon import (
     _adjust_muon_learning_rate,
     DistMuon,
 )
-from torchtitan.distributed.utils import build_transport_meshes
+from torchtitan.distributed.parallelism_context import ParallelismContext
 
 
 class TestDistMuonTensorParallelCPU(DTensorTestBase):
@@ -82,8 +83,12 @@ class TestDistMuonTensorParallelCPU(DTensorTestBase):
         values = torch.arange(36).reshape(12, 3).float().div_(41)
         gradient = values.mul(0.37).add(0.2).sin()
         lr = 0.03
-        (transport_mesh,) = build_transport_meshes(
-            [(mesh, ("dp_shard", "tp"))], max_ctas=None
+        ranks = mesh.mesh.flatten().tolist()
+        transport_mesh = DeviceMesh.from_group(
+            dist.new_group(ranks),
+            self.device_type,
+            mesh=torch.tensor(ranks),
+            mesh_dim_names=("dp_shard_tp",),
         )
         for storage_placements in (
             (Shard(0), Shard(0)),
@@ -103,9 +108,8 @@ class TestDistMuonTensorParallelCPU(DTensorTestBase):
                         compute_dtype=torch.bfloat16,
                     )
                 },
-                bucket_configs=(
-                    BucketConfig(patterns=("matrix",), mesh=transport_mesh),
-                ),
+                bucket_configs=(BucketConfig(patterns=("matrix",)),),
+                transport_meshes=(transport_mesh,),
                 lr=lr,
                 weight_decay=0,
                 momentum=0,
@@ -170,19 +174,25 @@ class TestDistMuonUnevenPipelineCPU(DTensorTestBase):
         """Stages with different buckets and storage meshes create every group.
 
         Stage 0 holds only a dense matrix on (dp_shard, tp); stage 1 holds only
-        experts on (edp_shard, ep), so neither has the other's storage mesh.
+        experts on (edp_shard, ep). Every rank still creates the dp_shard_tp
+        group of both stages, so the next WORLD group stays in sync.
         """
-        world_mesh = init_device_mesh(
-            "cpu", (self.world_size,), mesh_dim_names=("world",)
+        parallelism_context = ParallelismContext(
+            dp_replicate=1,
+            dp_shard=2,
+            cp=1,
+            tp=2,
+            pp=2,
+            ep=2,
+            world_size=self.world_size,
+            enable_sequence_parallel=False,
         )
-        dense_mesh = world_mesh._unflatten(
-            0, (2, 2, 2), mesh_dim_names=("pp", "dp_shard", "tp")
-        )["dp_shard", "tp"]
-        expert_mesh = world_mesh._unflatten(
-            0, (2, 2, 2), mesh_dim_names=("pp", "edp_shard", "ep")
-        )["edp_shard", "ep"]
+        with patch("torchtitan.distributed.parallelism_context.device_type", "cpu"):
+            parallelism_context.build_mesh()
         name = "dense" if self.rank < 4 else "experts"
-        mesh = dense_mesh if name == "dense" else expert_mesh
+        mesh = parallelism_context.get_mesh(
+            ["dp_shard", "tp"] if name == "dense" else ["edp_shard", "ep"]
+        )
         value = (
             torch.arange(16).reshape(4, 4).float().div_(32)
             if name == "dense"
@@ -215,9 +225,10 @@ class TestDistMuonUnevenPipelineCPU(DTensorTestBase):
             nesterov=True,
             ns_steps=2,
         )
-        optimizer = OptimizersContainer.Config(optimizers=[muon]).build(
-            model_parts=[model]
-        )
+        with patch("torchtitan.distributed.parallelism_context.device_type", "cpu"):
+            optimizer = OptimizersContainer.Config(optimizers=[muon]).build(
+                model_parts=[model], parallelism_context=parallelism_context
+            )
         # Nonmember ranks can skip native first-use group creation without an
         # immediate Gloo hang. The next WORLD group exposes the desynchronization.
         dist.barrier()

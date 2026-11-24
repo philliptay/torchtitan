@@ -15,14 +15,16 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import socket
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
+import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
@@ -489,6 +491,82 @@ class ParallelismContext:
                 f"Ensure the corresponding parallelism axes are {enabled_str}."
             )
         return mesh
+
+    def new_group_meshes(
+        self,
+        axes_list: Sequence[tuple[str, ...]],
+        *,
+        backend: str | None = None,
+        pg_options: Any = None,
+    ) -> dict[tuple[str, ...], DeviceMesh]:
+        """Create dedicated 1D meshes over combinations of mesh axes.
+
+        For each ``axes`` in ``axes_list``, creates one process group per slice
+        of those axes across the whole world and returns the 1D mesh of the
+        slice containing this rank, named by joining the axis names (e.g.
+        ``dp_shard_tp``). Ranks follow the global mesh order, so the
+        ``("dp_shard", "cp", "tp")`` mesh has the ranks of
+        ``mesh["dp_shard", "cp", "tp"]`` flattened. Slices with the same ranks
+        share one group.
+
+        Unlike the meshes from ``build_mesh``, these are not registered on the
+        root mesh, so DTensor never uses them. Each call creates new groups
+        with ``backend`` and ``pg_options``, so a component such as an
+        optimizer owns communicators with its own options.
+
+        Group creation is collective over the world: every rank must call this
+        with the same arguments in the same order, whichever pipeline stage
+        it owns.
+
+        Example: dp_shard=2, tp=2 (world 4, ranks laid out as
+        ``[[0, 1], [2, 3]]``) and ``axes_list=[("dp_shard", "tp")]`` create one
+        group ``[0, 1, 2, 3]``; ``[("dp_shard",)]`` creates ``[0, 2]`` and
+        ``[1, 3]``, and rank 1 gets the ``[1, 3]`` mesh.
+        """
+        if not self._single_axis_meshes:
+            self.build_mesh()
+        global_meshes = (self._global_meshes["dense"], self._global_meshes["sparse"])
+        rank = dist.get_rank()
+        group_by_ranks: dict[tuple[int, ...], dist.ProcessGroup | None] = {}
+        meshes = {}
+        for axes in axes_list:
+            global_mesh = next(
+                (
+                    mesh
+                    for mesh in global_meshes
+                    if mesh.mesh_dim_names is not None
+                    and set(axes) <= set(mesh.mesh_dim_names)
+                ),
+                None,
+            )
+            if global_mesh is None or len(set(axes)) != len(axes):
+                raise ValueError(f"Invalid mesh axis combination {axes}.")
+            axis_names = global_mesh.mesh_dim_names
+            assert axis_names is not None
+            mesh_axes = [axis_names.index(axis) for axis in axes]
+            other_axes = [i for i in range(len(axis_names)) if i not in mesh_axes]
+            slice_size = math.prod(global_mesh.mesh.shape[i] for i in mesh_axes)
+            slices = global_mesh.mesh.permute(*other_axes, *mesh_axes).reshape(
+                -1, slice_size
+            )
+            for ranks in map(tuple, slices.tolist()):
+                if ranks not in group_by_ranks:
+                    group = dist.new_group(
+                        list(ranks), backend=backend, pg_options=pg_options
+                    )
+                    group_by_ranks[ranks] = (
+                        group if isinstance(group, dist.ProcessGroup) else None
+                    )
+                if rank in ranks:
+                    group = group_by_ranks[ranks]
+                    assert group is not None
+                    meshes[axes] = DeviceMesh.from_group(
+                        group,
+                        device_type,
+                        mesh=torch.tensor(ranks),
+                        mesh_dim_names=("_".join(axes),),
+                    )
+        return meshes
 
     @contextlib.contextmanager
     def activate_spmd(self, *, typechecking: bool = False) -> Iterator[None]:

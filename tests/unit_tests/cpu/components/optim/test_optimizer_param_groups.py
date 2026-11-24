@@ -147,7 +147,7 @@ class TestOptimizerConfig(unittest.TestCase):
             class Config(BaseOptimizer.Config):
                 lr: float
 
-            def __init__(self, config: Config, *, params) -> None:
+            def __init__(self, config: Config, *, params, parallelism_context) -> None:
                 super().__init__(params, lr=config.lr)
 
         model = SimpleModel()
@@ -924,7 +924,7 @@ class TestLRSchedulerWithMixedOptimizers(unittest.TestCase):
             class Config(BaseOptimizer.Config):
                 lr: float = 1e-3
 
-            def __init__(self, config: Config, *, params) -> None:
+            def __init__(self, config: Config, *, params, parallelism_context) -> None:
                 super().__init__(params, lr=config.lr)
 
         model = torch.nn.Linear(2, 2)
