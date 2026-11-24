@@ -160,7 +160,9 @@ class RolloutWorkerActor(Actor):
 
     @concurrent_endpoint
     async def make_rdma_probe(self) -> RDMAProbe:
-        """A small buffer for every trainer DP replica leader to read at setup."""
+        """A small buffer that each reader of this worker's buffers reads at setup: every
+        trainer DP replica leader with `rdma_min_group_bytes` set, and rank 0 of each
+        generator with `rdma_min_image_bytes` set."""
         assert self._rdma_byte_buffers is not None and self._rdma_probe is None
         self._rdma_probe = make_rdma_probe(self._rdma_byte_buffers)
         return self._rdma_probe
