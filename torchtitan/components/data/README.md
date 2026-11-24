@@ -504,6 +504,26 @@ Only the order within a window changes: every microbatch is still trained once, 
 
 Datasets whose rows already cost about the same (C4, short chat SFT) gain little.
 
+`LocalBalancer` cannot fix a window in which one rank holds several heavy microbatches. `GlobalBalancer` plans the window across all data-parallel ranks and moves microbatches between them:
+
+1. each rank buffers its window and computes the costs;
+2. the ranks all-gather the costs over gloo;
+3. every rank computes the same plan: sort all microbatches by cost, step `k` gets the `k`-th group of one per rank, and within a step each stays on its own rank when possible;
+4. moved microbatches are pickled and sent point to point over gloo.
+
+```python
+from torchtitan.components.data import GlobalBalancer
+
+config.dataloader = GrainDataLoader.Config(
+    dataset=packed_pretraining_ds,
+    balancer=GlobalBalancer.Config(window_size=8),
+)
+```
+
+It runs on the loader's prefetch thread, so the exchange overlaps training. Any picklable microbatch moves, including `model_kwargs` with image tensors. CP and TP peers read the same microbatches and exchange with the ranks in the same position of other data-parallel ranks. It assumes the data-parallel mesh dimensions come before CP and TP and no pipeline parallelism, and checks this at startup. A peer that stops producing microbatches for 30 minutes makes the loader raise rather than fall back, since a rank that kept its own microbatches would train different data than its CP peers.
+
+Measured on 4 GB300 nodes (Qwen3.5-9B, 1M-token rows of up to 4 documents, DP 8 x CP 2, Ulysses, window 8): `GlobalBalancer` ran 82.0 s per step against 87.1 s for `LocalBalancer` (1.06x). Planning takes 0.1 ms and the exchange about 0.1 s per window, overlapped with training.
+
 # Distributed and checkpoint behavior
 
 Only the effective data-parallel coordinate selects data:
