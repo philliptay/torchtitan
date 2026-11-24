@@ -374,8 +374,8 @@ class BaseRolloutWorker(Configurable, ABC):
         Use it for groups of MBs: score-centering top-k logprobs at long completions (k=32:
         17 MB per 16-rollout group at 4K tokens), routed experts, or images; the controller then
         moves none of their bytes. Keep small groups by value: a leader reads every group of its
-        column before its first microbatch, and at 1, alphabet sort's 4.6 KB groups (256 per
-        step) added ~95 ms to that wait; ~1 MiB is a reasonable threshold.
+        column before its first microbatch, and at 1, alphabet sort's 8.7 KB groups (256 per
+        step) added ~32 ms to that wait (63 -> 95 ms); ~1 MiB is a reasonable threshold.
         Needs NIXL (`nixl==1.5.0` and `nixl-cu13`, installed by `scripts/install_rl_env.sh`) in
         every rollout worker and trainer DP replica leader, whatever
         `ModelStateDictTransport.Config.backend` is: the two are separate transports. Setup reads
