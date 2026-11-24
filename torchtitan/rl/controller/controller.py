@@ -18,7 +18,7 @@ _data_input_loop                                      _rollout_loop[N] (group wo
 | group_buffer.wait_for_slot()                     |  | work = group_buffer.claim_next()                  |
 | index, sample = rollouter.get_training_sample()  |  | finished = rollouter.run_group_rollouts(work)     |
 | work = RolloutGroupWork(group_id, sample)        |  | recorder.append_lines(finished.recorder_lines)    |
-| group_buffer.add_work(work)                      |  | group_buffer.finalize_work(finished.group)        |
+| group_buffer.add_work(work)                      |  | group_buffer.finalize_work(finished)              |
 +-----------------------+--------------------------+  +-----------------------+--------------------------+
                         |                                                     ^ |
                         |                                                     | |
@@ -31,33 +31,36 @@ RolloutGroupWorkBuffer
 | caller            group_buffer call                                            state / active slot                  |
 | _data_input_loop  add_work(RolloutGroupWork)                                   WAITING; slot acquired               |
 | _rollout_loop[N]  claim_next()                                                 WAITING -> CLAIMED                   |
-| _rollout_loop[N]  finalize_work(RolloutGroup)                                  CLAIMED -> FINALIZED                 |
-| _batcher_loop     RolloutGroup = take_finalized()                              FINALIZED -> taken (slot still held) |
-| _batcher_loop     release_slots([group_id], "untrainable_group")                slot released                        |
-| _trainer_loop     release_slots(batch.trainable_group_ids, "trained")           slots released after state dict pull |
+| _rollout_loop[N]  finalize_work(FinishedRolloutGroup)                          CLAIMED -> FINALIZED                 |
+| _batcher_loop     FinishedRolloutGroup = take_finalized()                      FINALIZED -> taken (slot still held) |
+| _batcher_loop     release_slots([group_id], "untrainable_group")               slot released                        |
+| _trainer_loop     release_slots(plan.trainable_group_ids, "trained")           slots released after state dict pull |
 +---------------------------------------------------------------------------------------------------------------------+
                                                   |
-                                                  | group = group_buffer.take_finalized()
+                                                  | finished = group_buffer.take_finalized()
                                                   v
 _batcher_loop
-+-------------------------------------------------------------------------------------------+
-| batch, trainable = batcher.add_group.call_one(group)                                      |
-| if no trainable samples: group_buffer.release_slots([group.group_id], "untrainable_group") |
-| training_batch_queue.put(TrainerStepBatch)                                                |
-+-----------------------+------------------------------+------------------------------------+
++----------------------------------------------------------------------------------------+
+| batch, trainable = batcher.add_group.call_one(finished.summary)                        |
+| if trainable: _packed_groups_by_id[group_id] = finished.packed  (bytes, no summary)    |
+| else: group_buffer.release_slots([group_id], "untrainable_group")                      |
+| training_batch_queue.put(StepPlan)                                                     |
++-----------------------+------------------------------+---------------------------------+
                         |  ^                           |
-          add group     |  | maybe_training_batch      | put batch
+          add summary   |  | maybe_plan                | put plan
                         v  |                           v
 Batcher (own process)                                training_batch_queue
 +-------------------------------------------------+   +----------------------------------------------+
-| decide specs per group from lengths             |   | size 1; holds TrainerStepBatch | None        |
-| at P groups: plan -> materialize -> pack        |   +---------------------+------------------------+
+| decide specs per group (summary only)           |   | size 1; holds StepPlan | None                |
+| at P groups: plan -> StepPlan                   |   +---------------------+------------------------+
 +-------------------------------------------------+                         |
-                                                                         | packed = training_batch_queue.get()
+                                                                         | plan = training_batch_queue.get()
                                                                          v
 _trainer_loop
 +----------------------------------------------------------------------------------------------------------+
-| train batch -> optim -> push/pull weights -> buffer.release_slots(batch.trainable_group_ids)              |
+| per DP rank d: leader_by_dp_rank[d].receive_replica_column(plan column d + the rollouts it names)        |
+| by_dp_rank[d].forward_backward(num groups, global counts): the leader packs, broadcasts to its replica   |
+| -> optim -> push/pull weights -> buffer.release_slots(plan.trainable_group_ids)                          |
 +----------------------------------------------------------------------------------------------------------+
 
 Backpressure (each loop: what it consumes/produces, and what gates each side):
@@ -70,7 +73,7 @@ _rollout_loop[N]
   consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
     waits for:    a claimable WAITING entry
     unblocked by: _data_input_loop group_buffer.add_work()
-  produces: RolloutGroup (group_buffer.finalize_work)
+  produces: FinishedRolloutGroup (group_buffer.finalize_work)
     waits for:    nothing (admits its own claimed slot)
     unblocked by: n/a
 
@@ -78,12 +81,12 @@ _batcher_loop
   consumes: the oldest FINALIZED group inside the window (group_buffer.take_finalized)
     waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
     unblocked by: _rollout_loop[N] group_buffer.finalize_work()
-  produces: TrainerStepBatch (training_batch_queue.put)
+  produces: StepPlan (training_batch_queue.put)
     waits for:    a free training_batch_queue slot (maxsize=1)
     unblocked by: _trainer_loop training_batch_queue.get()
 _trainer_loop
-  consumes: a TrainerStepBatch (training_batch_queue.get)
-    waits for:    a TrainerStepBatch in the queue
+  consumes: a StepPlan (training_batch_queue.get)
+    waits for:    a StepPlan in the queue
     unblocked by: _batcher_loop training_batch_queue.put()
 """
 
@@ -134,11 +137,14 @@ from torchtitan.rl.model_state_dict_transport import ModelStateDictTransport
 from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rdma_object import RDMAPrompt
 from torchtitan.rl.rollout import RolloutGroup
+from torchtitan.rl.rollout.finished_group import FinishedRolloutGroup
+from torchtitan.rl.rollout.packed_group import PackedRolloutGroup, unpack_rollout_group
 from torchtitan.rl.rollout.recorder import RolloutSampleRecorder
 from torchtitan.rl.rollout.rollouter import Rollouter
 from torchtitan.rl.rollout.types import Completion, GenerateFn, ReleaseSessionFn
 from torchtitan.rl.routing.inter_generator import InterGeneratorRouter
-from torchtitan.rl.trainer.batcher import Batcher, TrainerStepBatch
+from torchtitan.rl.trainer.batcher import Batcher, StepPlan
+from torchtitan.rl.trainer.microbatch_group_reader import ReplicaColumn
 from torchtitan.rl.trainer.trainer import Trainer
 from torchtitan.tools.garbage_collector import GarbageCollector
 
@@ -489,25 +495,6 @@ class Controller(Configurable):
                     "to control optimizer-step boundaries.",
                     stacklevel=2,
                 )
-            if (
-                self.async_loop.batcher.rdma_min_tensor_bytes is not None
-                and not self.trainer.training.preprocess_microbatch_groups_lazily
-            ):
-                warnings.warn(
-                    "async_loop.batcher.rdma_min_tensor_bytes is set without "
-                    "trainer.training.preprocess_microbatch_groups_lazily=True: trainer "
-                    "ranks read all microbatches before forward/backward, with no overlap.",
-                    stacklevel=2,
-                )
-            # TODO: read RDMA microbatches in pipeline-step groups.
-            if (
-                self.async_loop.batcher.rdma_min_tensor_bytes is not None
-                and self.trainer.parallelism.pipeline_parallel_degree > 1
-            ):
-                raise ValueError(
-                    "async_loop.batcher.rdma_min_tensor_bytes does not support "
-                    "trainer pipeline parallelism yet."
-                )
             generator_model = self.generator.model
             if self.vision_processor is None:
                 if isinstance(generator_model, MultimodalModel.Config):
@@ -532,10 +519,11 @@ class Controller(Configurable):
                 # The generator gives image tokens M-RoPE positions exactly when the model
                 # uses M-RoPE; the batcher must give the trainer the same.
                 uses_mrope = get_mrope_config(self.trainer.model) is not None
-                if self.async_loop.batcher.build_mrope_positions != uses_mrope:
+                packer = self.async_loop.batcher.microbatch_packer
+                if packer.build_mrope_positions != uses_mrope:
                     raise ValueError(
-                        "async_loop.batcher.build_mrope_positions="
-                        f"{self.async_loop.batcher.build_mrope_positions}, but the trainer "
+                        "async_loop.batcher.microbatch_packer.build_mrope_positions="
+                        f"{packer.build_mrope_positions}, but the trainer "
                         f"model's image tokens take {'M-RoPE' if uses_mrope else '1D'} "
                         f"positions; set it to {uses_mrope}."
                     )
@@ -611,6 +599,11 @@ class Controller(Configurable):
         self.generator_router: InterGeneratorRouter | None = None
         # The batcher's single-actor handle.
         self.batcher: Any | None = None
+        # Each trainable group the batcher has, packed, until its step sends the rollouts it trains
+        # on to the trainer's DP replica leaders (the batcher gets only summaries). Bytes, not the
+        # group's Python objects: holding those for several steps made the full GC collections
+        # frequent and slow.
+        self._packed_groups_by_id: dict[int, PackedRolloutGroup] = {}
         # Resume step (0 = fresh); set in setup_async from the loaded checkpoint.
         self.start_step = 0
         self.metrics_processor: m.MetricsProcessor = config.metrics.build(
@@ -814,6 +807,11 @@ class Controller(Configurable):
                 hf_assets_path=config.hf_assets_path,
                 max_num_documents=config.async_loop.batcher.max_num_documents,
                 output_dir=config.dump_folder,
+                training_sample_builder=async_loop.batcher.training_sample_builder,
+                microbatch_packer=async_loop.batcher.microbatch_packer,
+                pad_id=self.tokenizer.eos_id,
+                temperature=self._sampling.temperature,
+                vision_processor=config.vision_processor,
             )
             # TODO: torch.compile with aot_eager backend (inductor crashes the vLLM engine on the shared model path).
             self.generator_router = await actor_system.spawn_generator_router(
@@ -839,8 +837,6 @@ class Controller(Configurable):
                     if config.trainer.parallelism.pipeline_parallel_degree > 1
                     else 1
                 ),
-                pad_id=self.tokenizer.eos_id,
-                temperature=self._sampling.temperature,
                 output_dir=config.dump_folder,
                 enable_structured_logging=config.trainer.debug.enable_structured_logging,
                 vision_processor=config.vision_processor,
@@ -949,7 +945,12 @@ class Controller(Configurable):
                 )
                 num_failed_groups += 1
                 continue
-            rollout_groups.append(result.group)
+            rollout_groups.append(
+                replace(
+                    unpack_rollout_group(result.packed),
+                    metrics=result.summary.group.metrics,
+                )
+            )
 
         metrics = compute_rollout_metrics(
             prefix="validation",
@@ -1073,9 +1074,7 @@ class Controller(Configurable):
         )
 
         # training_batch_queue
-        training_batch_queue: asyncio.Queue[TrainerStepBatch | None] = asyncio.Queue(
-            maxsize=1
-        )
+        training_batch_queue: asyncio.Queue[StepPlan | None] = asyncio.Queue(maxsize=1)
 
         # rollout_loop
         generate_fn = self._make_generate_fn()
@@ -1165,6 +1164,7 @@ class Controller(Configurable):
                 *self._validation_tasks,
                 return_exceptions=True,
             )
+            self._packed_groups_by_id.clear()
 
         await self._maybe_validate_after_training(step=num_training_steps)
 
@@ -1273,7 +1273,7 @@ class Controller(Configurable):
         consumes: a WAITING RolloutGroupWork (group_buffer.claim_next)
             waits for:    a claimable WAITING entry
             unblocked by: _data_input_loop group_buffer.add_work()
-        produces: RolloutGroup (group_buffer.finalize_work)
+        produces: FinishedRolloutGroup (group_buffer.finalize_work)
             waits for:    nothing (admits its own claimed slot)
             unblocked by: n/a
         """
@@ -1295,28 +1295,30 @@ class Controller(Configurable):
                     )
                 # save rollout for inspection
                 self.rollout_recorder.append_lines(finished.recorder_lines)
-                group = finished.group
-                del finished
+                finished = replace(finished, recorder_lines="")
             except Exception:
                 logger.exception(f"rollout group {work.group_id} failed; dropping")
-                group = RolloutGroup(
-                    group_id=work.group_id,
-                    rollouts=[],
-                    metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
+                finished = FinishedRolloutGroup.from_group(
+                    RolloutGroup(
+                        group_id=work.group_id,
+                        rollouts=[],
+                        metrics=[m.Metric("rollout/group_failures", m.Sum(1.0))],
+                    )
                 )
             # The group makes no more generation calls, so its cache salts can go.
             await self.generator_router.release_groups.call_one([work.group_id])
-            await group_buffer.finalize_work(group)
+            await group_buffer.finalize_work(finished)
 
-            # Drop both refs (work.rollout_group is the group too): held groups made every full GC slow.
-            del group, work
+            # Drop both refs (work.finished_group is the group too): held groups made every full GC slow.
+            del finished, work
 
     async def _batcher_loop(
         self,
         *,
-        training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
+        training_batch_queue: "asyncio.Queue[StepPlan | None]",
     ) -> None:
-        """Send finalized groups to the batcher actor and queue each training batch it returns.
+        """Send each finalized group's summary to the batcher actor and queue each training batch
+        it returns. Keep each trainable group's packed bytes until `_trainer_loop` sends them.
 
         On a clean close/shutdown the group_buffer drains and returns None; we forward a `None` sentinel
         so the trainer stops.
@@ -1324,38 +1326,41 @@ class Controller(Configurable):
         consumes: the oldest FINALIZED group inside the window (group_buffer.take_finalized)
             waits for:    a group inside the window becoming FINALIZED (any group when windowed_fifo_batches is None)
             unblocked by: _rollout_loop[N] group_buffer.finalize_work()
-        produces: TrainerStepBatch (training_batch_queue.put)
+        produces: StepPlan (training_batch_queue.put)
             waits for:    a free training_batch_queue slot (maxsize=1)
             unblocked by: _trainer_loop training_batch_queue.get()
         """
         while True:
-            rollout_group = await self._group_buffer.take_finalized()
-            if rollout_group is None:  # closed and drained
+            finished = await self._group_buffer.take_finalized()
+            if finished is None:  # closed and drained
                 logger.info("Buffer drained; batcher loop stopping")
                 break
-            # We put a group in. We may get a batch back
+            # We put a group in. We may get a plan back
             # if there are enough accumulated trainable groups to return one.
             with sl.log_trace_span("batcher_add_group"):
                 (
-                    maybe_training_batch,
+                    maybe_plan,
                     group_is_trainable,
-                ) = await self.batcher.add_group.call_one(rollout_group=rollout_group)
-            if not group_is_trainable:
+                ) = await self.batcher.add_group.call_one(summary=finished.summary)
+            if group_is_trainable:
+                self._packed_groups_by_id[finished.group_id] = finished.packed
+            else:
                 await self._group_buffer.release_slots(
-                    [rollout_group.group_id], reason="untrainable_group"
+                    [finished.group_id], reason="untrainable_group"
                 )
-            if maybe_training_batch is not None:
-                await training_batch_queue.put(maybe_training_batch)
+            del finished
+            if maybe_plan is not None:
+                await training_batch_queue.put(maybe_plan)
         await training_batch_queue.put(None)
         # TODO(async-rl): if finite datasets are supported, drain a final partial batch here.
 
     async def _trainer_loop(
         self,
-        training_batch_queue: "asyncio.Queue[TrainerStepBatch | None]",
+        training_batch_queue: "asyncio.Queue[StepPlan | None]",
         *,
         num_training_steps: int,
     ) -> None:
-        """Run num_training_steps optimizer steps: train one packed batch, push the trainer's model
+        """Run num_training_steps optimizer steps: train one planned batch, push the trainer's model
         state dict, then pull it into the generators, log metrics.
 
         The pull of policy N overlaps forward/backward N+1; the push before it does not:
@@ -1373,8 +1378,8 @@ class Controller(Configurable):
         Impact on off-policiness: no sample is born stale, because the buffer admits new rollout
         groups only after the generators load the new policy.
 
-        consumes: a TrainerStepBatch (training_batch_queue.get)
-            waits for:    a TrainerStepBatch in the queue
+        consumes: a StepPlan (training_batch_queue.get)
+            waits for:    a StepPlan in the queue
             unblocked by: _batcher_loop training_batch_queue.put()
         """
         # The previous step's pull, returning its wall time; None before the first.
@@ -1393,22 +1398,22 @@ class Controller(Configurable):
                 sl.log_trace_span("train_step"),
                 step_timer.record("timing/step/total"),
             ):
-                # Waits for a TrainerStepBatch to be ready (or None on shutdown).
+                # Waits for a StepPlan to be ready (or None on shutdown).
                 with (
                     sl.log_trace_span("wait_for_training_batch"),
                     step_timer.record("timing/step/wait_for_training_batch"),
                 ):
-                    packed = await training_batch_queue.get()
+                    plan = await training_batch_queue.get()
 
-                if packed is None:
+                if plan is None:
                     logger.info("Batcher closed and drained; stopping training")
                     break
 
                 # Policy age is computed HERE, at consumption time, against the live trainer version, so it is
-                # faithful to what this step trains on -- not the version when the batch was packed.
+                # faithful to what this step trains on -- not the version when the batch was planned.
                 policy_age_panel = compute_policy_age_metrics(
                     trainer_policy_version=self._trainer_policy_version,
-                    min_policy_versions=packed.min_policy_versions,
+                    min_policy_versions=plan.min_policy_versions,
                     target_offpolicy_steps=(
                         self.config.async_loop.target_offpolicy_steps
                     ),
@@ -1418,40 +1423,45 @@ class Controller(Configurable):
                 # TODO(async): can't stream microbatches (interleave pack->train) -- the loss is normalized by
                 #   global counts over ALL microbatches, needed before any fwd/bwd. To
                 #   support streaming, accumulate raw loss/token counts across microbatches and scale before optimizer.
+                # TODO: the leaders pack only once forward_backward starts. With
+                #   training.preprocess_microbatch_groups_lazily=False (the default), the engine
+                #   reads every microbatch group before its first forward, so the column send
+                #   and the leaders' materialize, pack and broadcast all wait in this step; with
+                #   it on, the first group still waits for the column's materialize. Sending the
+                #   columns during the previous step would hide them.
+                with (
+                    sl.log_trace_span("send_replica_columns"),
+                    step_timer.record("timing/step/send_replica_columns"),
+                ):
+                    columns = self._replica_columns(plan)
+                    # By value: the leaders now hold the bytes.
+                    for group_id in plan.trainable_group_ids:
+                        del self._packed_groups_by_id[group_id]
+                    await self._send_replica_columns(columns)
+                    del columns
                 with (
                     sl.log_trace_span("forward_backward"),
                     step_timer.record("timing/step/forward_backward"),
                 ):
-                    # TODO: each rank's first read is never hidden (~0.5 GB/s per rank, 4 ranks over TCP).
-                    # Sending the RDMAMicrobatches during the previous optim_step would hide it.
-                    try:
-                        # Send each DP rank only its column of the grid.
-                        fwd_bwd_results = await asyncio.gather(
-                            *(
-                                trainer_at_dp_rank.forward_backward.call(
-                                    [
-                                        [row[dp_rank] for row in group]
-                                        for group in packed.microbatch_groups
-                                    ],
-                                    packed.global_loss_token_counts,
-                                    packed.global_routing_token_counts,
-                                )
-                                for dp_rank, trainer_at_dp_rank in enumerate(
-                                    self.trainer.by_dp_rank
-                                )
+                    fwd_bwd_results = await asyncio.gather(
+                        *(
+                            trainer_at_dp_rank.forward_backward.call(
+                                num_microbatch_groups=len(plan.microbatch_groups),
+                                global_loss_token_counts=plan.global_loss_token_counts,
+                                global_routing_token_counts=(
+                                    plan.global_routing_token_counts
+                                ),
                             )
+                            for trainer_at_dp_rank in self.trainer.by_dp_rank
                         )
-                        # Under PP, only trainer ranks holding the last stage
-                        # compute the loss; the others return None.
-                        fwd_bwd_metrics = next(
-                            rank_metrics
-                            for rank_metrics in fwd_bwd_results[0].values()
-                            if rank_metrics is not None
-                        )
-                    finally:
-                        # With RDMA, every rank has read its column (or the step failed).
-                        # Not awaited: it would wait behind an in-flight add_group.
-                        self.batcher.maybe_release_oldest_batch.broadcast()
+                    )
+                    # Under PP, only trainer ranks holding the last stage
+                    # compute the loss; the others return None.
+                    fwd_bwd_metrics = next(
+                        rank_metrics
+                        for rank_metrics in fwd_bwd_results[0].values()
+                        if rank_metrics is not None
+                    )
 
                     if not math.isfinite(fwd_bwd_metrics["loss/mean"]):
                         logger.error("Loss is NaN/Inf; training diverged")
@@ -1466,7 +1476,7 @@ class Controller(Configurable):
                     # before the corresponding optimizer step is durable. The
                     # batcher includes every consumed group ID here, including
                     # metric-only zero-std groups excluded from model inputs.
-                    self._rollouter.commit_training_sample_ids(packed.group_ids)
+                    self._rollouter.commit_training_sample_ids(plan.group_ids)
                     optimizer_result = self._get_rank_0_value(
                         await self.trainer.all_ranks.optim_step.call(
                             resume_state=self._rollouter.state_dict(),
@@ -1504,7 +1514,7 @@ class Controller(Configurable):
                 pull_task = asyncio.create_task(
                     self._pull_model_state_dict_and_release_groups(
                         optimizer_result.policy_version,
-                        trainable_group_ids=packed.trainable_group_ids,
+                        trainable_group_ids=plan.trainable_group_ids,
                     )
                 )
 
@@ -1516,7 +1526,7 @@ class Controller(Configurable):
                     step=step,
                     is_validation=False,
                     metrics=[
-                        *packed.metrics,
+                        *plan.metrics,
                         *[
                             m.Metric(key, m.NoReduce(value))
                             for key, value in fwd_bwd_metrics.items()
@@ -1539,7 +1549,7 @@ class Controller(Configurable):
                         ),
                         *compute_perf_ratio_metrics(
                             num_global_valid_tokens=int(
-                                packed.global_loss_token_counts[0]
+                                plan.global_loss_token_counts[0]
                             ),
                             time_metrics=time_metrics,
                         ),
@@ -1555,6 +1565,44 @@ class Controller(Configurable):
         # (`validate_after_training`).
         if pull_task is not None:
             await pull_task
+
+    def _replica_columns(self, plan: StepPlan) -> list[ReplicaColumn]:
+        """Each DP replica's column of `plan`, with the rollouts it names: a group's rollouts can
+        land on several replicas, and each gets only the ones it trains on."""
+        columns = []
+        for dp_rank in range(self.trainer_dp_degree):
+            microbatch_groups = [
+                [row[dp_rank] for row in group] for group in plan.microbatch_groups
+            ]
+            rollout_ids_by_group_id: dict[int, set[int]] = {}
+            for group in microbatch_groups:
+                for microbatch_specs in group:
+                    for spec in microbatch_specs:
+                        rollout_ids_by_group_id.setdefault(
+                            spec.rollout_id.group_id, set()
+                        ).add(spec.rollout_id.rollout_id)
+            columns.append(
+                ReplicaColumn(
+                    microbatch_groups=microbatch_groups,
+                    rollout_groups=[
+                        self._packed_groups_by_id[group_id].select(rollout_ids)
+                        for group_id, rollout_ids in rollout_ids_by_group_id.items()
+                    ],
+                )
+            )
+        return columns
+
+    async def _send_replica_columns(self, columns: list[ReplicaColumn]) -> None:
+        """Send each DP replica's leader its column."""
+        assert self.trainer is not None
+        await asyncio.gather(
+            *(
+                leader.receive_replica_column.call_one(column)
+                for leader, column in zip(
+                    self.trainer.leader_by_dp_rank, columns, strict=True
+                )
+            )
+        )
 
     async def _pull_model_state_dict_and_release_groups(
         self, version: int, *, trainable_group_ids: list[int]

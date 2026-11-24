@@ -47,7 +47,7 @@ class _ChooseRunGroupEndpoint:
         if self.error is not None:
             raise self.error
         group = RolloutGroup(group_id=kwargs["group_id"], rollouts=[])
-        return FinishedRolloutGroup(group=group, recorder_lines="")
+        return FinishedRolloutGroup.from_group(group)
 
 
 def test_rollout_worker_actor_builds_its_worker_and_inits_its_logger(
@@ -237,7 +237,7 @@ def test_rollout_group_dispatch_uses_choose(monkeypatch) -> None:
         ]
 
         actor_mesh.run_group.release.set()
-        assert (await dispatch).group.group_id == 1
+        assert (await dispatch).group_id == 1
         await rollouter.close()
         assert actor_mesh.stopped
 
